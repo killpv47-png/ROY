@@ -1,0 +1,83 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - name: Install
+        run: pip install -r requirements-dev.txt
+      - name: Compile
+        run: python -m compileall -q cr_analyst scripts migrations
+      - name: i18n completeness (10 languages)
+        run: python scripts/check_i18n.py
+      - name: Migrations (SQLite upgrade/downgrade/upgrade + drift check)
+        env:
+          DATABASE_URL: sqlite+aiosqlite:///./data/ci.db
+        run: |
+          alembic upgrade head
+          alembic check
+          alembic downgrade base
+          alembic upgrade head
+      - name: Unit + integration tests (no network, no real secrets)
+        env:
+          BOT_TOKEN: ""
+          LLM_API_KEY: ""
+          TAVILY_KEY: ""
+          CLASH_API_TOKEN: ""
+        run: python -m pytest -q
+
+  postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: cr
+          POSTGRES_PASSWORD: cr
+          POSTGRES_DB: cr
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U cr" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgresql://cr:cr@localhost:5432/cr
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: pip install -r requirements-dev.txt
+      - name: Migrations on PostgreSQL
+        run: |
+          python scripts/db_migrate.py
+          alembic check
+      - name: Database tests on PostgreSQL
+        env:
+          TEST_DATABASE_URL: postgresql://cr:cr@localhost:5432/cr
+        run: python -m pytest -q -m "not sqlite_only" tests/test_db_integration.py

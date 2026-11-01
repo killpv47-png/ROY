@@ -1,0 +1,11 @@
+aiogram==3.31.0
+httpx[socks]==0.28.1
+SQLAlchemy[asyncio]==2.1.6
+aiosqlite==0.22.1
+asyncpg==0.32.0
+alembic==1.20.1
+pydantic==2.13.5
+pydantic-settings==2.16.2
+cryptography==50.0.2
+pillow==13.0.0
+PyYAML==6.0.3

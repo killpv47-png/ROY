@@ -1,0 +1,14 @@
+[project]
+name = "cr-analyst"
+version = "1.0.0"
+description = "Clash Royale AI Analyst - Telegram bot with a Hermes-style agent, official API scanner and deck engine"
+requires-python = ">=3.11"
+readme = "README.md"
+license = { text = "MIT" }
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]
