@@ -34,8 +34,16 @@ def parse_skill_md(text: str) -> tuple[dict, str]:
 
 
 def render_skill_md(name: str, description: str, version: int, tags: list[str], body: str) -> str:
-    fm = yaml.safe_dump({"name": name, "description": description, "version": version, "tags": tags},
-                        allow_unicode=True, sort_keys=False).strip()
+    fm = yaml.safe_dump(
+        {
+            "name": name,
+            "description": description,
+            "version": version,
+            "tags": tags,
+        },
+        allow_unicode=True,
+        sort_keys=False,
+    ).strip()
     return f"---\n{fm}\n---\n\n{body.strip()}\n"
 
 
@@ -49,51 +57,118 @@ class SkillLibrary:
         added = 0
         if not self.dir.is_dir():
             return 0
+
         for p in sorted(self.dir.glob("*/SKILL.md")):
             try:
                 meta, body = parse_skill_md(p.read_text(encoding="utf-8"))
             except Exception as e:
                 log.warning("invalid skill %s: %s", p, e)
                 continue
+
             ver = int(meta.get("version", 1))
+
             async with self.db.session() as s:
-                exists = (await s.execute(select(AgentSkill.id).where(AgentSkill.name == meta["name"],
-                                                                      AgentSkill.version == ver))).first()
+                exists = (
+                    await s.execute(
+                        select(AgentSkill.id).where(
+                            AgentSkill.name == meta["name"],
+                            AgentSkill.version == ver,
+                        )
+                    )
+                ).first()
+
                 if exists:
                     continue
-                newer = (await s.execute(select(func.max(AgentSkill.version)).where(
-                    AgentSkill.name == meta["name"]))).scalar()
+
+                newer = (
+                    await s.execute(
+                        select(func.max(AgentSkill.version)).where(
+                            AgentSkill.name == meta["name"]
+                        )
+                    )
+                ).scalar()
+
                 if newer and newer > ver:
                     continue
-                s.add(AgentSkill(name=meta["name"], version=ver, description=str(meta["description"])[:256],
-                                 tags=list(meta.get("tags") or []), content=body[:MAX_SKILL_CHARS], origin="bundled"))
+
+                raw_tags = meta.get("tags") or []
+                tags = [str(tag) for tag in raw_tags if tag is not None]
+
+                s.add(
+                    AgentSkill(
+                        name=meta["name"],
+                        version=ver,
+                        description=str(meta["description"])[:256],
+                        tags=tags,
+                        content=body[:MAX_SKILL_CHARS],
+                        origin="bundled",
+                    )
+                )
                 added += 1
+
         return added
 
     async def _latest(self, s, name: str, status: str = "active") -> AgentSkill | None:
-        return (await s.execute(select(AgentSkill).where(AgentSkill.name == name, AgentSkill.status == status)
-                                .order_by(AgentSkill.version.desc()).limit(1))).scalar_one_or_none()
+        return (
+            await s.execute(
+                select(AgentSkill)
+                .where(
+                    AgentSkill.name == name,
+                    AgentSkill.status == status,
+                )
+                .order_by(AgentSkill.version.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
 
     async def index(self) -> list[dict]:
         async with self.db.session() as s:
-            rows = (await s.execute(select(AgentSkill).where(AgentSkill.status == "active")
-                                    .order_by(AgentSkill.name, AgentSkill.version.desc()))).scalars().all()
+            rows = (
+                await s.execute(
+                    select(AgentSkill)
+                    .where(AgentSkill.status == "active")
+                    .order_by(
+                        AgentSkill.name,
+                        AgentSkill.version.desc(),
+                    )
+                )
+            ).scalars().all()
+
         seen, out = set(), []
+
         for r in rows:
             if r.name in seen:
                 continue
+
             seen.add(r.name)
-            out.append({"name": r.name, "description": r.description, "version": r.version, "tags": r.tags,
-                        "origin": r.origin, "usage": r.usage_count})
+            out.append(
+                {
+                    "name": r.name,
+                    "description": r.description,
+                    "version": r.version,
+                    "tags": r.tags,
+                    "origin": r.origin,
+                    "usage": r.usage_count,
+                }
+            )
+
         return out
 
     async def load(self, name: str) -> dict | None:
         async with self.db.session() as s:
             r = await self._latest(s, name)
+
             if not r:
                 return None
+
             r.usage_count += 1
-            return {"name": r.name, "version": r.version, "description": r.description, "content": r.content}
+
+            return {
+                "name": r.name,
+                "version": r.version,
+                "description": r.description,
+                "content": r.content,
+            }
 
     async def match(self, task_kind: str, text: str = "") -> list[str]:
         """Cheap routing: choose skills by task kind / tags without loading bodies."""
@@ -105,13 +180,22 @@ class SkillLibrary:
             "api_check": ["api_troubleshooting"],
             "ask": [],
         }
+
         names = list(kind_map.get(task_kind, []))
-        low = text.lower()
+        low = str(text or "").lower()
+
         for sk in await self.index():
             if sk["name"] in names:
                 continue
-            if any(tag and tag.lower() in low for tag in sk.get("tags") or []):
+
+            # FIX: YAML may parse numeric tags (e.g. 403) as integers.
+            # Convert tags to strings before calling lower().
+            if any(
+                tag is not None and str(tag).lower() in low
+                for tag in (sk.get("tags") or [])
+            ):
                 names.append(sk["name"])
+
         return names[:3]
 
     async def write_approval_required(self) -> bool:
@@ -119,45 +203,116 @@ class SkillLibrary:
             row = await s.get(AppConfig, "skills_write_approval")
             return bool(row and row.value.get("v"))
 
-    async def record_improvement(self, name: str, body: str, *, description: str | None = None,
-                                 tags: list[str] | None = None, origin: str = "agent") -> dict:
+    async def record_improvement(
+        self,
+        name: str,
+        body: str,
+        *,
+        description: str | None = None,
+        tags: list[str] | None = None,
+        origin: str = "agent",
+    ) -> dict:
         body = body.strip()[:MAX_SKILL_CHARS]
+
         if len(body) < 40:
             raise ValueError("skill body too short")
-        status = "pending" if origin == "agent" and await self.write_approval_required() else "active"
+
+        status = (
+            "pending"
+            if origin == "agent" and await self.write_approval_required()
+            else "active"
+        )
+
         async with self.db.session() as s:
             cur = await self._latest(s, name)
+
             if cur and cur.content.strip() == body:
-                return {"name": name, "version": cur.version, "status": "unchanged"}
-            ver = ((await s.execute(select(func.max(AgentSkill.version)).where(AgentSkill.name == name))).scalar()
-                   or 0) + 1
-            s.add(AgentSkill(name=name, version=ver, description=(description or (cur.description if cur else name))[:256],
-                             tags=tags if tags is not None else (cur.tags if cur else []), content=body,
-                             origin=origin, status=status))
-        return {"name": name, "version": ver, "status": status}
+                return {
+                    "name": name,
+                    "version": cur.version,
+                    "status": "unchanged",
+                }
+
+            ver = (
+                (
+                    await s.execute(
+                        select(func.max(AgentSkill.version)).where(
+                            AgentSkill.name == name
+                        )
+                    )
+                ).scalar()
+                or 0
+            ) + 1
+
+            source_tags = tags if tags is not None else (cur.tags if cur else [])
+            safe_tags = [
+                str(tag)
+                for tag in (source_tags or [])
+                if tag is not None
+            ]
+
+            s.add(
+                AgentSkill(
+                    name=name,
+                    version=ver,
+                    description=(
+                        description or (cur.description if cur else name)
+                    )[:256],
+                    tags=safe_tags,
+                    content=body,
+                    origin=origin,
+                    status=status,
+                )
+            )
+
+        return {
+            "name": name,
+            "version": ver,
+            "status": status,
+        }
 
     async def pending(self) -> list[AgentSkill]:
         async with self.db.session() as s:
-            return list((await s.execute(select(AgentSkill).where(AgentSkill.status == "pending"))).scalars())
+            return list(
+                (
+                    await s.execute(
+                        select(AgentSkill).where(
+                            AgentSkill.status == "pending"
+                        )
+                    )
+                ).scalars()
+            )
 
     async def approve(self, skill_id: int, approve: bool = True) -> bool:
         async with self.db.session() as s:
             r = await s.get(AgentSkill, skill_id)
+
             if not r or r.status != "pending":
                 return False
+
             r.status = "active" if approve else "archived"
             return True
 
     async def append_lesson(self, name: str, lesson: str) -> dict | None:
         """Self-improvement: add a generalisable pitfall to the skill's 'Lessons' section (deduplicated)."""
         cur = await self.load(name)
+
         if not cur:
             return None
+
         lesson = lesson.strip()[:200]
+
         if lesson.lower() in cur["content"].lower():
-            return {"name": name, "status": "unchanged"}
+            return {
+                "name": name,
+                "status": "unchanged",
+            }
+
         body = cur["content"]
+
         if "## Lessons" not in body:
             body += "\n\n## Lessons\n"
+
         body += f"\n- {lesson}"
+
         return await self.record_improvement(name, body)
