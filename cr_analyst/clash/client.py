@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
@@ -25,7 +26,12 @@ class ClashAPIError(Exception):
     code = "unknown"
     retryable = False
 
-    def __init__(self, message: str = "", status: int | None = None, reason: str | None = None):
+    def __init__(
+        self,
+        message: str = "",
+        status: int | None = None,
+        reason: str | None = None,
+    ):
         super().__init__(message or self.code)
         self.status = status
         self.reason = reason
@@ -73,12 +79,14 @@ class NetworkError(ClashAPIError):
 
 class RouteRejected(ClashAPIError):
     """Egress verification failed — request not sent."""
+
     code = "route_rejected"
 
 
 @dataclass
 class Route:
     """Verified network route for authenticated requests."""
+
     proxy_url: str | None
     egress_ip: str | None
     label: str
@@ -90,125 +98,397 @@ RouteResolver = Callable[[], Awaitable[Route]]
 TokenResolver = Callable[[], Awaitable[str | None]]
 
 
+def _clean_log_field(value: Any, limit: int = 300) -> str:
+    """Convert an API error field into a bounded, single-line log value."""
+    if value is None:
+        return ""
+
+    text = " ".join(str(value).split())
+    return text[:limit]
+
+
 def classify(status: int, body: dict | None) -> ClashAPIError:
-    reason = (body or {}).get("reason", "") or ""
-    message = (body or {}).get("message", "") or ""
+    """Convert an official API response into a typed exception."""
+
+    payload = body if isinstance(body, dict) else {}
+
+    reason = str(payload.get("reason") or "")
+    message = str(payload.get("message") or "")
+
+    normalized_reason = reason.casefold()
+
     if status == 403:
-        if "invalidIp" in reason or "IP" in message:
+        is_invalid_ip = (
+            "invalidip" in normalized_reason
+            or re.search(
+                r"\bip(?:\s+address)?\b",
+                message,
+                flags=re.IGNORECASE,
+            ) is not None
+        )
+
+        if is_invalid_ip:
             return InvalidIP(message, status, reason)
+
         return AccessDenied(message, status, reason)
+
+    if status == 401:
+        return AccessDenied(message, status, reason)
+
     if status == 404:
         return NotFound(message, status, reason)
+
     if status == 400:
         return BadRequest(message, status, reason)
+
     if status == 429:
         return RateLimited(message, status, reason)
+
     if status == 503:
         return Maintenance(message, status, reason)
+
     return ServerError(message, status, reason)
 
 
 class ClashClient:
-    def __init__(self, base_url: str, token_resolver: TokenResolver, route_resolver: RouteResolver | None = None,
-                 *, timeout: float = 15.0, max_retries: int = 3, transport: httpx.AsyncBaseTransport | None = None,
-                 health_hook: Callable[..., Awaitable[None]] | None = None):
+
+    def __init__(
+        self,
+        base_url: str,
+        token_resolver: TokenResolver,
+        route_resolver: RouteResolver | None = None,
+        *,
+        timeout: float = 15.0,
+        max_retries: int = 3,
+        transport: httpx.AsyncBaseTransport | None = None,
+        health_hook: Callable[..., Awaitable[None]] | None = None,
+    ):
         self.base_url = base_url.rstrip("/")
         self._token = token_resolver
         self._route = route_resolver
+
         self.timeout = timeout
         self.max_retries = max_retries
+
         self._transport = transport
         self._health = health_hook
+
         self._clients: dict[str | None, httpx.AsyncClient] = {}
 
     def _client(self, proxy: str | None) -> httpx.AsyncClient:
         if proxy not in self._clients:
-            kw: dict[str, Any] = {"timeout": self.timeout, "headers": {"Accept": "application/json",
-                                                                       "User-Agent": "cr-analyst/1.0"}}
+
+            kw: dict[str, Any] = {
+                "timeout": self.timeout,
+                "headers": {
+                    "Accept": "application/json",
+                    "User-Agent": "cr-analyst/1.0",
+                },
+            }
+
             if self._transport is not None:
                 kw["transport"] = self._transport
+
             elif proxy:
                 kw["proxy"] = proxy
+
             self._clients[proxy] = httpx.AsyncClient(**kw)
+
         return self._clients[proxy]
 
     async def aclose(self) -> None:
-        for c in self._clients.values():
-            await c.aclose()
+        for client in self._clients.values():
+            await client.aclose()
+
         self._clients.clear()
 
-    async def request(self, path: str, params: dict | None = None) -> Any:
+    async def request(
+        self,
+        path: str,
+        params: dict | None = None,
+    ) -> Any:
+
+        # ---------------------------------------------------------
+        # Resolve developer API key
+        # ---------------------------------------------------------
+
         token = await self._token()
+
         if not token:
-            raise NotConfigured("No Clash Royale developer API key configured")
-        route = await self._route() if self._route else Route(None, None, "direct", True)
+            raise NotConfigured(
+                "No Clash Royale developer API key configured"
+            )
+
+        # ---------------------------------------------------------
+        # Resolve and verify network route
+        # ---------------------------------------------------------
+
+        route = (
+            await self._route()
+            if self._route
+            else Route(
+                proxy_url=None,
+                egress_ip=None,
+                label="direct",
+                verified=True,
+            )
+        )
+
         if not route.verified:
-            raise RouteRejected(route.warning or "Egress route not verified")
+            raise RouteRejected(
+                route.warning or "Egress route not verified"
+            )
+
         url = f"{self.base_url}{path}"
+
         attempt = 0
+
+        # ---------------------------------------------------------
+        # API request with bounded retries
+        # ---------------------------------------------------------
+
         while True:
+
             attempt += 1
             t0 = time.monotonic()
+
             try:
-                resp = await self._client(route.proxy_url).get(
-                    url, params=params, headers={"Authorization": f"Bearer {token}"})
-            except (httpx.TimeoutException, httpx.TransportError) as e:
-                err: ClashAPIError = NetworkError(type(e).__name__)
+
+                resp = await self._client(
+                    route.proxy_url
+                ).get(
+                    url,
+                    params=params,
+                    headers={
+                        "Authorization": f"Bearer {token}"
+                    },
+                )
+
+            except (
+                httpx.TimeoutException,
+                httpx.TransportError,
+            ) as exc:
+
+                err: ClashAPIError = NetworkError(
+                    type(exc).__name__
+                )
+
                 status = None
+                latency = int(
+                    (time.monotonic() - t0) * 1000
+                )
+
+                await self._record(
+                    False,
+                    status,
+                    latency,
+                    route,
+                    f"{path}: {err.code}",
+                )
+
             else:
+
                 status = resp.status_code
-                latency = int((time.monotonic() - t0) * 1000)
+
+                latency = int(
+                    (time.monotonic() - t0) * 1000
+                )
+
+                # -------------------------------------------------
+                # Successful response
+                # -------------------------------------------------
+
                 if status == 200:
-                    await self._record(True, status, latency, route, path)
+
+                    await self._record(
+                        True,
+                        status,
+                        latency,
+                        route,
+                        path,
+                    )
+
                     return resp.json()
+
+                # -------------------------------------------------
+                # Parse error response
+                # -------------------------------------------------
+
                 try:
-                    body = resp.json()
+                    parsed_body = resp.json()
+
+                    if isinstance(parsed_body, dict):
+                        body = parsed_body
+                    else:
+                        body = None
+
                 except Exception:
                     body = None
+
+                # -------------------------------------------------
+                # Classify API error
+                # -------------------------------------------------
+
                 err = classify(status, body)
-                await self._record(False, status, latency, route, f"{path}: {err.code}")
+
+                # -------------------------------------------------
+                # IMPORTANT: Diagnostic logging
+                # -------------------------------------------------
+
+                if status in (400, 401, 403):
+
+                    if isinstance(body, dict):
+
+                        reason = _clean_log_field(
+                            body.get("reason"),
+                            200,
+                        )
+
+                        message = _clean_log_field(
+                            body.get("message"),
+                            300,
+                        )
+
+                    else:
+
+                        reason = ""
+
+                        # Only a short preview of the response body
+                        # is logged if the response was not JSON.
+                        message = _clean_log_field(
+                            resp.text,
+                            300,
+                        )
+
+                    log.warning(
+                        "Clash API diagnostic: "
+                        "status=%s "
+                        "reason=%s "
+                        "message=%s "
+                        "route=%s "
+                        "egress_ip=%s",
+                        status,
+                        reason,
+                        message,
+                        route.label,
+                        route.egress_ip or "unknown",
+                    )
+
+                # -------------------------------------------------
+                # Record API health information
+                # -------------------------------------------------
+
+                await self._record(
+                    False,
+                    status,
+                    latency,
+                    route,
+                    f"{path}: {err.code}",
+                )
+
+            # -----------------------------------------------------
+            # Retry handling
+            # -----------------------------------------------------
+
             if not err.retryable or attempt > self.max_retries:
                 raise err
-            delay = min(8.0, 0.6 * 2 ** (attempt - 1)) + random.uniform(0, 0.3)
+
+            delay = (
+                min(
+                    8.0,
+                    0.6 * 2 ** (attempt - 1),
+                )
+                + random.uniform(0, 0.3)
+            )
+
             if status == 429:
                 delay = max(delay, 1.5)
-            log.info("Clash API %s on %s; retry %d in %.1fs", err.code, path, attempt, delay)
+
+            log.info(
+                "Clash API %s; retry %d in %.1fs",
+                err.code,
+                attempt,
+                delay,
+            )
+
             await asyncio.sleep(delay)
 
-    async def _record(self, ok, status, latency, route: Route, detail):
+    async def _record(
+        self,
+        ok,
+        status,
+        latency,
+        route: Route,
+        detail,
+    ):
+
         if self._health:
+
             try:
-                await self._health(ok=ok, status=status, latency=latency, egress=route.egress_ip, detail=detail)
-            except Exception:  # pragma: no cover
+
+                await self._health(
+                    ok=ok,
+                    status=status,
+                    latency=latency,
+                    egress=route.egress_ip,
+                    detail=detail,
+                )
+
+            except Exception:
                 pass
 
-    # ---------------------------------------------------------------- endpoints
+    # -------------------------------------------------------------
+    # Official Clash Royale API endpoints
+    # -------------------------------------------------------------
+
     async def get_player(self, tag: str) -> dict:
-        return await self.request(f"/players/{encode_tag(tag)}")
+        return await self.request(
+            f"/players/{encode_tag(tag)}"
+        )
 
     async def get_battlelog(self, tag: str) -> list[dict]:
-        return await self.request(f"/players/{encode_tag(tag)}/battlelog")
+        return await self.request(
+            f"/players/{encode_tag(tag)}/battlelog"
+        )
 
     async def get_upcoming_chests(self, tag: str) -> dict:
-        return await self.request(f"/players/{encode_tag(tag)}/upcomingchests")
+        return await self.request(
+            f"/players/{encode_tag(tag)}/upcomingchests"
+        )
 
     async def get_cards(self) -> dict:
         return await self.request("/cards")
 
     async def get_clan(self, tag: str) -> dict:
-        return await self.request(f"/clans/{encode_tag(tag)}")
+        return await self.request(
+            f"/clans/{encode_tag(tag)}"
+        )
 
     async def get_clan_members(self, tag: str) -> dict:
-        return await self.request(f"/clans/{encode_tag(tag)}/members")
+        return await self.request(
+            f"/clans/{encode_tag(tag)}/members"
+        )
 
     async def get_river_race(self, tag: str) -> dict:
-        return await self.request(f"/clans/{encode_tag(tag)}/currentriverrace")
+        return await self.request(
+            f"/clans/{encode_tag(tag)}/currentriverrace"
+        )
 
     async def search_tournaments(self, name: str) -> dict:
-        return await self.request("/tournaments", params={"name": name, "limit": 10})
+        return await self.request(
+            "/tournaments",
+            params={
+                "name": name,
+                "limit": 10,
+            },
+        )
 
     async def get_tournament(self, tag: str) -> dict:
-        return await self.request(f"/tournaments/{encode_tag(tag)}")
+        return await self.request(
+            f"/tournaments/{encode_tag(tag)}"
+        )
 
     async def get_global_tournaments(self) -> dict:
-        return await self.request("/globaltournaments")
+        return await self.request(
+            "/globaltournaments"
+        )
